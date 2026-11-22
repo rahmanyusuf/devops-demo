@@ -1,0 +1,89 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: devops-demo
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production        # add a required reviewer in repo settings = manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build artefact (immutable, named by commit SHA)
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          echo "$SHORT_SHA" > app/VERSION
+          mkdir -p build
+          (cd app && zip -r ../build/app.zip app.py requirements.txt VERSION)
+
+      - name: Publish artefact to S3
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="devops-demo-artifacts-${ACCOUNT_ID}"
+          echo "BUCKET=$BUCKET" >> "$GITHUB_ENV"
+          aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || aws s3 mb "s3://$BUCKET"
+          aws s3 cp build/app.zip "s3://$BUCKET/releases/${SHORT_SHA}.zip"
+
+      - name: Deploy infrastructure + application (CloudFormation, rolling update)
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/template.yaml \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              ArtifactBucket="$BUCKET" \
+              ArtifactKey="releases/${SHORT_SHA}.zip" \
+              AppVersion="$SHORT_SHA" \
+            --no-fail-on-empty-changeset
+
+      - name: Smoke test (the deployed version must match this commit)
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerURL'].OutputValue" --output text)
+          echo "URL=$URL" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do
+            BODY=$(curl -sf "$URL/health" || true)
+            echo "$BODY"
+            if echo "$BODY" | grep -q "\"version\":\"$SHORT_SHA\""; then
+              echo "### Deployed $SHORT_SHA to $URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Smoke test failed" && exit 1
+
+      - name: Drift detection (IaC integrity check)
+        run: |
+          ID=$(aws cloudformation detect-stack-drift --stack-name "$STACK_NAME" \
+            --query StackDriftDetectionId --output text)
+          for i in $(seq 1 30); do
+            S=$(aws cloudformation describe-stack-drift-detection-status \
+              --stack-drift-detection-id "$ID" --query DetectionStatus --output text)
+            [ "$S" != "DETECTION_IN_PROGRESS" ] && break; sleep 5
+          done
+          aws cloudformation describe-stack-drift-detection-status \
+            --stack-drift-detection-id "$ID" --query StackDriftStatus --output text

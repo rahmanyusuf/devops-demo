@@ -1,0 +1,7 @@
+-r app/requirements.txt
+pytest
+pytest-cov
+flake8
+cfn-lint
+checkov
+pip-audit

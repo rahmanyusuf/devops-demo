@@ -1,0 +1,30 @@
+name: ci
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install tooling
+        run: pip install -r requirements-dev.txt
+      - name: Lint (flake8)
+        run: flake8 app tests
+      - name: Unit tests with coverage gate
+        run: pytest --cov=app --cov-fail-under=80
+      - name: Dependency vulnerability scan (pip-audit)
+        run: pip-audit -r app/requirements.txt
+      - name: IaC validation (cfn-lint)
+        run: cfn-lint infra/template.yaml
+      - name: IaC security scan (Checkov)
+        # soft-fail: findings are reported and discussed (no HTTPS/logging by design in a lab)
+        run: checkov -d infra --framework cloudformation --soft-fail

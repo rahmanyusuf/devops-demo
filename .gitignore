@@ -1,0 +1,6 @@
+build/
+app/VERSION
+__pycache__/
+.coverage
+.pytest_cache/
+venv/
